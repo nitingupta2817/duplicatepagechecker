@@ -4,6 +4,7 @@ import hashlib
 from collections import Counter
 from copy import copy
 from io import BytesIO, StringIO
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
@@ -105,8 +106,162 @@ def export_excel(grid, removed, axis, source=None, sheet=None):
     return output.getvalue()
 
 
-def main():
-    st.set_page_config(page_title="URL Duplicate Cleaner", page_icon="🔗", layout="wide")
+# ---------------------------------------------------------------------------
+# URL Analyzer page helpers
+# ---------------------------------------------------------------------------
+
+def parse_url_list(text, trim=True):
+    """One URL per cell: splits on new lines and tabs (works for an Excel column or row)."""
+    cells = [c for line in text.splitlines() for c in line.split("\t")]
+    if trim:
+        cells = [c.strip() for c in cells]
+    return [c for c in cells if c.strip()]
+
+
+def extract_domain(url, merge_www=True):
+    """Return the lower-case host name, e.g. 'https://WWW.Example.com:8080/a' -> 'example.com'."""
+    u = url.strip()
+    try:
+        host = urlparse(u if "://" in u else "//" + u).hostname or ""
+    except ValueError:
+        host = ""
+    host = host.lower().rstrip(".")
+    if merge_www and host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def analyze_urls(urls, merge_www=True):
+    url_counts = Counter(urls)
+    domains = [extract_domain(u, merge_www) or "(no domain found)" for u in urls]
+
+    per_domain = {}
+    for url, dom in zip(urls, domains):
+        d = per_domain.setdefault(dom, {"entries": 0, "urls": set()})
+        d["entries"] += 1
+        d["urls"].add(url)
+    domain_table = pd.DataFrame(
+        [{"Domain": dom,
+          "Total URLs": d["entries"],
+          "Different URLs": len(d["urls"]),
+          "Exact duplicate copies": d["entries"] - len(d["urls"])}
+         for dom, d in per_domain.items()]
+    ).sort_values(["Total URLs", "Domain"], ascending=[False, True], ignore_index=True)
+
+    dup_table = pd.DataFrame(
+        [{"URL": u, "Domain": extract_domain(u, merge_www) or "(no domain found)",
+          "Times found": n, "Extra copies": n - 1}
+         for u, n in url_counts.items() if n > 1],
+        columns=["URL", "Domain", "Times found", "Extra copies"],
+    ).sort_values(["Times found", "URL"], ascending=[False, True], ignore_index=True)
+
+    domain_counts = Counter(domains)
+    all_table = pd.DataFrame({
+        "Position": range(1, len(urls) + 1),
+        "URL": urls,
+        "Domain": domains,
+        "URL count": [url_counts[u] for u in urls],
+        "URLs on same domain": [domain_counts[d] for d in domains],
+    })
+
+    summary = {
+        "Total URLs pasted": len(urls),
+        "Different (unique) URLs": len(url_counts),
+        "Exact duplicate copies": len(urls) - len(url_counts),
+        "URLs that are repeated": len(dup_table),
+        "Different domains": len(per_domain),
+        "Domains with more than one URL": int((domain_table["Total URLs"] > 1).sum()),
+        "URLs sharing a domain with another URL": int(
+            domain_table.loc[domain_table["Total URLs"] > 1, "Total URLs"].sum()),
+    }
+    return summary, domain_table, dup_table, all_table
+
+
+def report_excel(summary, domain_table, dup_table, all_table):
+    wb = Workbook()
+    sheets = [("Summary", pd.DataFrame(list(summary.items()), columns=["Metric", "Value"])),
+              ("By domain", domain_table), ("Exact duplicates", dup_table), ("All URLs", all_table)]
+    for n, (title, df) in enumerate(sheets):
+        ws = wb.active if n == 0 else wb.create_sheet()
+        ws.title = title
+        ws.append(list(df.columns))
+        for row in df.itertuples(index=False):
+            ws.append([v.item() if hasattr(v, "item") else v for v in row])
+        for row in ws:
+            for c in row:
+                if isinstance(c.value, str):
+                    c.data_type = "s"  # keep text literal, even if it starts with '='
+        for i, col in enumerate(df.columns, 1):
+            width = max([len(str(col))] + [len(str(v)) for v in df[col].head(500)])
+            ws.column_dimensions[get_column_letter(i)].width = min(width + 2, 80)
+    output = BytesIO()
+    wb.save(output)
+    return output.getvalue()
+
+
+def analyzer_page():
+    st.title("URL Analyzer")
+    st.write("Paste a bulk list of URLs to see how many are different, how many share a domain, "
+             "and how many are exact duplicates.")
+    text = st.text_area("Paste URLs (one per line, or copy an Excel column / row)", height=250,
+                        placeholder="https://example.com/a\nhttps://example.com/b\nhttps://example.com/a\nhttps://another.org/page")
+    c1, c2 = st.columns(2)
+    trim = c1.checkbox("Ignore spaces before / after URLs", value=True, key="an_trim")
+    merge_www = c2.checkbox("Treat www.example.com and example.com as the same domain", value=True)
+    st.caption("Exact duplicate = the full URL text matches exactly (case, http/https, trailing "
+               "slashes and query parameters count as different). Blank cells are ignored.")
+    if not text.strip():
+        return
+    urls = parse_url_list(text, trim)
+    if not urls:
+        st.warning("No URLs found in the pasted text.")
+        return
+
+    summary, domain_table, dup_table, all_table = analyze_urls(urls, merge_www)
+
+    st.subheader("Summary")
+    m = st.columns(4)
+    m[0].metric("Total URLs pasted", summary["Total URLs pasted"])
+    m[1].metric("Different URLs", summary["Different (unique) URLs"])
+    m[2].metric("Exact duplicate copies", summary["Exact duplicate copies"],
+                help="Extra copies beyond the first of each URL. Deleting these leaves only different URLs.")
+    m[3].metric("URLs that are repeated", summary["URLs that are repeated"],
+                help="How many distinct URLs appear more than once.")
+    m = st.columns(4)
+    m[0].metric("Different domains", summary["Different domains"])
+    m[1].metric("Domains with 2+ URLs", summary["Domains with more than one URL"])
+    m[2].metric("URLs sharing a domain", summary["URLs sharing a domain with another URL"],
+                help="URLs whose domain also appears on at least one other pasted URL.")
+
+    tab1, tab2, tab3 = st.tabs(["Same domain", "Exact duplicates", "All URLs"])
+    with tab1:
+        st.caption("Each domain with how many URLs point to it.")
+        st.dataframe(domain_table, hide_index=True, use_container_width=True)
+    with tab2:
+        if dup_table.empty:
+            st.success("No exact duplicate URLs found.")
+        else:
+            st.caption("URLs that appear more than once in your list.")
+            st.dataframe(dup_table, hide_index=True, use_container_width=True)
+    with tab3:
+        def highlight(row):
+            color = "#ffe0df" if row["URL count"] > 1 else ""
+            return [f"background-color: {color}; color: #222" if color else ""] * len(row)
+        st.caption("Red = this exact URL appears more than once.")
+        st.dataframe(all_table.style.apply(highlight, axis=1), hide_index=True,
+                     use_container_width=True)
+
+    st.download_button("Download report (Excel)",
+                       report_excel(summary, domain_table, dup_table, all_table),
+                       "url_analysis.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# ---------------------------------------------------------------------------
+# Duplicate Cleaner page (original tool)
+# ---------------------------------------------------------------------------
+
+def cleaner_page():
     st.title("URL Duplicate Cleaner")
     st.write("Paste Excel cells, review highlighted duplicate URLs, then delete in bulk and download.")
     mode = st.radio("Input", ["Paste from Excel", "Upload Excel (.xlsx)"], horizontal=True)
@@ -231,6 +386,15 @@ def main():
                 st.error(str(exc))
     except Exception as exc:
         st.error(f"Could not read the data: {exc}")
+
+
+def main():
+    st.set_page_config(page_title="URL Tools", page_icon="🔗", layout="wide")
+    page = st.sidebar.radio("Page", ["Duplicate Cleaner", "URL Analyzer"])
+    if page == "Duplicate Cleaner":
+        cleaner_page()
+    else:
+        analyzer_page()
 
 
 if __name__ == "__main__":
